@@ -1,8 +1,11 @@
 module Sch
 
 using Distributed
+import MemPool: DRef
 
 import ..Dagger: Context, Thunk, Chunk, OSProc, order, free!, dependents, noffspring, istask, inputs, affinity, tochunk, @dbg, @logmsg, timespan_start, timespan_end, unrelease, procs
+
+include("fault-handler.jl")
 
 const OneToMany = Dict{Thunk, Set{Thunk}}
 struct ComputeState
@@ -16,17 +19,34 @@ struct ComputeState
     thunk_dict::Dict{Int, Any}
 end
 
-struct ComputeOptions
+"""
+    SchedulerOptions
+
+Stores DAG-global options to be passed to the Dagger.Sch scheduler. Options:
+- single::Int   # Force all work onto worker with specified id. `0` disables this option.
+"""
+struct SchedulerOptions
     single::Int
 end
-ComputeOptions() = ComputeOptions(0)
+SchedulerOptions() = SchedulerOptions(0)
+
+"""
+    ThunkOptions
+
+Stores Thunk-local options to be passed to the Dagger.Sch scheduler. Options:
+- single::Int   # Force thunk onto worker with specified id. `0` disables this option.
+"""
+struct ThunkOptions
+    single::Int
+end
+ThunkOptions() = ThunkOptions(0)
 
 function cleanup(ctx)
 end
 
-function compute_dag(ctx, d::Thunk; options=ComputeOptions())
+function compute_dag(ctx, d::Thunk; options=SchedulerOptions())
     if options === nothing
-        options = ComputeOptions()
+        options = SchedulerOptions()
     end
     master = OSProc(myid())
     @dbg timespan_start(ctx, :scheduler_init, 0, master)
@@ -54,7 +74,6 @@ function compute_dag(ctx, d::Thunk; options=ComputeOptions())
     @dbg timespan_end(ctx, :scheduler_init, 0, master)
 
     while !isempty(state.ready) || !isempty(state.running)
-
         if isempty(state.running) && !isempty(state.ready)
             for p in ps
                 isempty(state.ready) && break
@@ -72,7 +91,18 @@ function compute_dag(ctx, d::Thunk; options=ComputeOptions())
 
         proc, thunk_id, res = take!(chan)
         if isa(res, CapturedException) || isa(res, RemoteException)
-            throw(res)
+            if check_exited_exception(res)
+                @warn "Worker $(proc.pid) died on thunk $thunk_id, rescheduling work"
+
+                # Remove dead worker from procs list
+                filter!(p->p.pid!=proc.pid, ctx.procs)
+                ps = procs(ctx)
+
+                handle_fault(ctx, state, state.thunk_dict[thunk_id], proc, chan, node_order)
+                continue
+            else
+                throw(res)
+            end
         end
         node = state.thunk_dict[thunk_id]
         @logmsg("WORKER $(proc.pid) - $node ($(node.f)) input:$(node.inputs)")
@@ -193,6 +223,9 @@ function fire_task!(ctx, thunk, proc, state, chan, node_order)
         istask(x) ? state.cache[x] : x
     end
     state.thunk_dict[thunk.id] = thunk
+    if thunk.options !== nothing && thunk.options.single > 0
+        proc = OSProc(thunk.options.single)
+    end
     async_apply(ctx, proc, thunk.id, thunk.f, data, chan, thunk.get_result, thunk.persist, thunk.cache)
 end
 
